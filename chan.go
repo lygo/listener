@@ -5,10 +5,22 @@ import (
 	"context"
 	"fmt"
 	"io"
+	golog "log"
 	"net"
 	"sync"
 	"time"
 )
+
+
+var (
+	debugNET = true
+)
+
+func log(args ...interface{}) {
+	if debugNET {
+		golog.Println(args...)
+	}
+}
 
 
 var (
@@ -82,16 +94,21 @@ func DialChannel(ctx context.Context,network, address string)  (*ChanConn,error)
 	}
 
 	conn := &ChanConn{
+		prefix: `client`,
+		once: new(sync.Once),
 		ctx:ctx,
 		raddr:address,
 		readBuff: new(bytes.Buffer),
 		read:make(chan []byte,0),
-		write:make(chan []byte,1),
+		write:make(chan []byte,0),
+		accepted:make(chan struct{},0),
 	}
 	err := listener.send(conn)
 	if err != nil {
 		return nil, err
 	}
+
+	<-conn.accepted
 
 	return conn,nil
 }
@@ -101,7 +118,7 @@ func ListenChannel(ctx context.Context, address string) (*ChanListener,error) {
 		ctx: ctx,
 		once: new(sync.Once),
 		addr: ChanAddr(address),
-		conns: make(chan *ChanConn,1),
+		conns: make(chan *ChanConn,0),
 	}
 
 	err := registryChannelListener(lis)
@@ -113,14 +130,25 @@ func ListenChannel(ctx context.Context, address string) (*ChanListener,error) {
 }
 
 type ChanConn struct {
+	prefix string
+	once *sync.Once
 	raddr string
 	ctx context.Context
 	readBuff *bytes.Buffer
 	read chan []byte
 	write chan []byte
+	accepted chan struct{}
+	closed bool
 }
 
 func (c ChanConn) Read(b []byte) (n int, err error) {
+	defer func () {
+		log(`{`,c.prefix,`}`,"READ \nERR",fmt.Sprint(err),"\n", fmt.Sprintf("%s",b))
+	}()
+
+	if c.closed {
+		return 0,io.EOF
+	}
 
 	if c.readBuff.Len() > 0  {
 		n, err = c.readBuff.Read(b)
@@ -145,7 +173,16 @@ func (c ChanConn) Read(b []byte) (n int, err error) {
 	}
 }
 
+
 func (c ChanConn) Write(b []byte) (n int, err error) {
+	defer func () {
+		log(`{`,c.prefix,`}`,"WRITE ","\n","ERR",fmt.Sprint(err), "\n",fmt.Sprintf("%s",b))
+	}()
+
+	if c.closed {
+		return 0, io.EOF
+	}
+
 	select {
 	case c.write <- b:
 		return len(b), nil
@@ -154,9 +191,13 @@ func (c ChanConn) Write(b []byte) (n int, err error) {
 	}
 }
 
-func (c ChanConn) Close() error {
-	close(c.read)
-	close(c.write)
+func (c *ChanConn) Close() error {
+	c.once.Do(func () {
+		log("{",c.prefix,"} closed")
+		c.closed = true
+		close(c.read)
+		close(c.write)
+	})
 	return nil
 }
 
@@ -198,40 +239,57 @@ func (c ChanListener) Accept() (net.Conn, error) {
 	if !ok {
 		return nil, io.EOF
 	}
+	log("{ server } <-")
 
 	lisConn := &ChanConn{
+		prefix: `server`,
 		ctx: conn.ctx,
+		once: new(sync.Once),
 		raddr: conn.raddr,
 		readBuff: new(bytes.Buffer),
-		read:make(chan []byte,1),
+		read:make(chan []byte,0),
 		write:make(chan []byte,0),
 	}
-
-	p := <- conn.write
-	lisConn.read <- p
 
 	start := make(chan struct{})
 	go func () {
 		close(start)
-		select {
-		case d, ok  := <- lisConn.write:
-			if !ok {
+		for {
+			select {
+			case d, ok  := <- conn.write:
+				if !ok {
+					log("client connection was closed")
+					return
+				}
+				if !lisConn.closed {
+					lisConn.read <- d
+				}
+				log("{ client } >> { server }")
+			case d, ok  := <- lisConn.write:
+				if !ok {
+					log("server connection was closed")
+					return
+				}
+				if !conn.closed {
+					conn.read <- d
+					log("{ server } >> { client }")
+				}
+			case <- lisConn.ctx.Done():
+				return
+			case <- conn.ctx.Done():
 				return
 			}
-			conn.read <- d
-		case <- conn.ctx.Done():
-			return
 		}
 	}()
-
-	<-start
-
+	<- start
+	close(conn.accepted)
 	return lisConn, nil
 }
 
 func (c ChanListener) send(conn *ChanConn) error {
 	select {
 	case c.conns <- conn:
+		log("{ client } ->")
 		return nil
 	case <-c.ctx.Done():
 		return c.ctx.Err()
